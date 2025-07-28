@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+
 #ifdef USE_RDPMC  /* Needs echo 2 > /sys/devices/cpu/rdpmc */
 
 static inline uint64_t cpucycles(void) {
@@ -24,6 +26,18 @@ static inline uint64_t cpucycles(void) {
     : "=a" (result) : : "%rdx");
 
   return result;
+}
+
+#endif
+
+#else  // Non-x86: fallback to clock_gettime
+
+#include <time.h>
+
+static inline uint64_t cpucycles(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
 #endif
