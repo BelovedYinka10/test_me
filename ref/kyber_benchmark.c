@@ -3,6 +3,36 @@
  * Includes warm-up, stack guidance, stddev, Valgrind hints, and clear output
  */
 
+#define KYBER_K 2  // Change this to 3 or 4 for Kyber768 or Kyber1024
+
+#if KYBER_K == 2
+  #define CRYPTO_PUBLICKEYBYTES  pqcrystals_kyber512_PUBLICKEYBYTES
+  #define CRYPTO_SECRETKEYBYTES  pqcrystals_kyber512_SECRETKEYBYTES
+  #define CRYPTO_CIPHERTEXTBYTES pqcrystals_kyber512_CIPHERTEXTBYTES
+  #define CRYPTO_BYTES           pqcrystals_kyber512_BYTES
+  #define crypto_kem_keypair     pqcrystals_kyber512_ref_keypair
+  #define crypto_kem_enc         pqcrystals_kyber512_ref_enc
+  #define crypto_kem_dec         pqcrystals_kyber512_ref_dec
+#elif KYBER_K == 3
+  #define CRYPTO_PUBLICKEYBYTES  pqcrystals_kyber768_PUBLICKEYBYTES
+  #define CRYPTO_SECRETKEYBYTES  pqcrystals_kyber768_SECRETKEYBYTES
+  #define CRYPTO_CIPHERTEXTBYTES pqcrystals_kyber768_CIPHERTEXTBYTES
+  #define CRYPTO_BYTES           pqcrystals_kyber768_BYTES
+  #define crypto_kem_keypair     pqcrystals_kyber768_ref_keypair
+  #define crypto_kem_enc         pqcrystals_kyber768_ref_enc
+  #define crypto_kem_dec         pqcrystals_kyber768_ref_dec
+#elif KYBER_K == 4
+  #define CRYPTO_PUBLICKEYBYTES  pqcrystals_kyber1024_PUBLICKEYBYTES
+  #define CRYPTO_SECRETKEYBYTES  pqcrystals_kyber1024_SECRETKEYBYTES
+  #define CRYPTO_CIPHERTEXTBYTES pqcrystals_kyber1024_CIPHERTEXTBYTES
+  #define CRYPTO_BYTES           pqcrystals_kyber1024_BYTES
+  #define crypto_kem_keypair     pqcrystals_kyber1024_ref_keypair
+  #define crypto_kem_enc         pqcrystals_kyber1024_ref_enc
+  #define crypto_kem_dec         pqcrystals_kyber1024_ref_dec
+#else
+  #error "KYBER_K must be 2, 3, or 4"
+#endif
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
