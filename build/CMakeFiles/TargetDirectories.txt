@@ -1,0 +1,5 @@
+/Users/mac/Desktop/test/kyber/build/CMakeFiles/kyber512.dir
+/Users/mac/Desktop/test/kyber/build/CMakeFiles/kyber768.dir
+/Users/mac/Desktop/test/kyber/build/CMakeFiles/kyber1024.dir
+/Users/mac/Desktop/test/kyber/build/CMakeFiles/edit_cache.dir
+/Users/mac/Desktop/test/kyber/build/CMakeFiles/rebuild_cache.dir
