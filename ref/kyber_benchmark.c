@@ -53,7 +53,7 @@ static double calculate_stddev(const uint64_t *data, size_t count, double mean) 
 }
 
 static void analyze_cycles(const char *label, const uint64_t *data) {
-    uint64_t min = data[0], max = data[0], sum = 0;
+    uint64_t min = UINT64_MAX, max = 0, sum = 0;
     for (int i = 0; i < ITERATIONS; ++i) {
         if (data[i] < min) min = data[i];
         if (data[i] > max) max = data[i];
