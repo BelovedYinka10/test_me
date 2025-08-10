@@ -1,105 +1,48 @@
-// main.c — Kyber benchmark with time, cycles, and HEAP + STACK usage
+// kyber_mem_time_cycles.c — Kyber per-op Peak Memory + Avg Time + (scaled) Avg Cycles
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
-#include <string.h>
 #include <stdlib.h>
-#include <sched.h>
+#include <string.h>
 #include <unistd.h>
-#include <sys/resource.h>
-#include <sys/ioctl.h>
+#include <time.h>
 #include <linux/perf_event.h>
 #include <asm/unistd.h>
-#include <time.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <errno.h>
-#include <pthread.h>
 
 #include "kem.h"  // PQCrystals Kyber API
 
-#ifndef ITERATIONS
-#define ITERATIONS 1000
+#ifndef NUM_ITERATIONS
+#define NUM_ITERATIONS 1000
 #endif
 
-// ---------- timing ----------
-static inline double time_diff_ns(struct timespec s, struct timespec e) {
-    return (e.tv_sec - s.tv_sec) * 1e9 + (e.tv_nsec - s.tv_nsec);
+// -------- timing --------
+static inline double tdiff_ns(struct timespec s, struct timespec e){
+    return (e.tv_sec - s.tv_sec)*1e9 + (e.tv_nsec - s.tv_nsec);
 }
 
-// ---------- perf_event_open wrapper ----------
-static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
-                            int cpu, int group_fd, unsigned long flags) {
-    return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
+// -------- perf_event_open --------
+static long perf_event_open_sys(struct perf_event_attr *a, pid_t pid, int cpu, int g, unsigned long f){
+    return syscall(__NR_perf_event_open, a, pid, cpu, g, f);
 }
 
-// ---------- optional: pin to CPU 0 ----------
-static void pin_to_cpu0(void) {
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    CPU_SET(0, &mask);
-    (void)sched_setaffinity(0, sizeof(mask), &mask);
-}
-
-// ---------- HEAP usage (KB) ----------
-#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
-#define HAVE_MALLINFO2 1
-#endif
-
-#ifdef HAVE_MALLINFO2
-#include <malloc.h>
-static long current_heap_kb(void) {
-    struct mallinfo2 mi = mallinfo2();
-    return (long)(mi.uordblks / 1024); // bytes -> KB
-}
-#else
-#include <malloc.h>
-static long current_heap_kb(void) {
-    struct mallinfo mi = mallinfo();
-    return (long)(mi.uordblks / 1024); // bytes -> KB (may truncate on 32-bit)
-}
-#endif
-
-// ---------- STACK usage (KB) ----------
-// Uses pthread_getattr_np to get base + size of the current (main) thread's stack.
-// POSIX defines attr.stackaddr as the *lowest* address; for downward-growing stacks,
-// current usage ~= (stack_base + stack_size) - current_sp.
-static long current_stack_kb(void) {
-    pthread_attr_t attr;
-    if (pthread_getattr_np(pthread_self(), &attr) != 0) return -1;
-
-    void *stack_base = NULL; // lowest address
-    size_t stack_size = 0;
-    int r = pthread_attr_getstack(&attr, &stack_base, &stack_size);
-    pthread_attr_destroy(&attr);
-    if (r != 0 || stack_base == NULL || stack_size == 0) return -1;
-
-    volatile int marker = 0;
-    void *sp = (void *)&marker;
-
-    // Compute distance between "top" (base + size) and current SP.
-    char *low  = (char *)stack_base;
-    char *high = low + stack_size; // expected upper bound for downward growth
-    char *csp  = (char *)sp;
-
-    long used_bytes;
-    if (csp <= high && csp >= low) {
-        // Common case: downward-growing within bounds
-        used_bytes = (long)(high - csp);
-    } else {
-        // Fallback if addresses are unexpected (different growth direction)
-        // Use absolute distance to nearest bound as a conservative estimate.
-        long d1 = (long)llabs((long)(csp - low));
-        long d2 = (long)llabs((long)(high - csp));
-        used_bytes = d1 < d2 ? d1 : d2;
+// -------- /proc/self/status helpers (KB) --------
+static long read_status_kb(const char *key){
+    FILE *f = fopen("/proc/self/status","r");
+    if(!f) return -1;
+    char line[256]; long val=-1; size_t k=strlen(key);
+    while(fgets(line,sizeof line,f)) {
+        if(strncmp(line,key,k)==0){
+            if(sscanf(line+k," %ld",&val)==1) break;
+        }
     }
-    if (used_bytes < 0) used_bytes = 0;
-    return used_bytes / 1024; // KB
+    fclose(f); return val;
 }
 
-// ---------- main ----------
-int main(void) {
-    pin_to_cpu0();
-
-    // Setup perf (cycles); if unavailable, we’ll still report time/mem
+// -------- perf setup helper (per-thread, scaled read) --------
+static int perf_open_cycles_scaled(struct perf_event_attr *pe_out){
     struct perf_event_attr pe;
     memset(&pe, 0, sizeof(pe));
     pe.type = PERF_TYPE_HARDWARE;
@@ -108,170 +51,167 @@ int main(void) {
     pe.disabled = 1;
     pe.exclude_kernel = 1;
     pe.exclude_hv = 1;
+    pe.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+    *pe_out = pe;
+    // per-thread counting (pid=0 self, cpu=-1 any)
+    int fd = perf_event_open_sys(&pe, 0, -1, -1, 0);
+    return fd;
+}
 
-    int perf_ok = 1;
-    int fd_probe = perf_event_open(&pe, 0, 0, -1, 0);
-    if (fd_probe == -1) {
-        perf_ok = 0;
-        fprintf(stderr,
-            "Warning: perf_event_open failed (%s). Cycles will be N/A.\n"
-            "Hint: try: sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid'\n",
-            strerror(errno));
-    } else {
-        close(fd_probe);
+static double perf_read_avg_cycles(int fd){
+    struct {
+        uint64_t value;
+        uint64_t time_enabled;
+        uint64_t time_running;
+    } rd = {0};
+    ssize_t r = read(fd, &rd, sizeof(rd));
+    if (r != (ssize_t)sizeof(rd) || rd.time_running == 0) return 0.0;
+    double scaled = (double)rd.value;
+    if (rd.time_enabled && rd.time_running && rd.time_running != rd.time_enabled) {
+        scaled *= (double)rd.time_enabled / (double)rd.time_running;
     }
+    return scaled / (double)NUM_ITERATIONS;
+}
 
+/* ===================== child runners ===================== */
+
+static void child_keypair(int wfd){
+    uint8_t pk[CRYPTO_PUBLICKEYBYTES];
+    uint8_t sk[CRYPTO_SECRETKEYBYTES];
+
+    // warm-up
+    crypto_kem_keypair(pk, sk);
+
+    struct perf_event_attr pe;
+    int perf_ok = 1;
+    int fd = perf_open_cycles_scaled(&pe);
+    if (fd == -1) { perror("perf_event_open keypair"); perf_ok = 0; }
+
+    struct timespec s,e;
+    clock_gettime(CLOCK_MONOTONIC, &s);
+    if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
+
+    for (int i=0; i<NUM_ITERATIONS; ++i) crypto_kem_keypair(pk, sk);
+
+    if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_DISABLE, 0); }
+    clock_gettime(CLOCK_MONOTONIC, &e);
+
+    double avg_ms = (tdiff_ns(s,e)/1e6)/NUM_ITERATIONS;
+    double avg_cycles = perf_ok ? perf_read_avg_cycles(fd) : 0.0;
+    if (perf_ok) close(fd);
+
+    long peak_kb = read_status_kb("VmHWM:");
+    dprintf(wfd, "KPY %.6f %.0f %ld\n", avg_ms, avg_cycles, peak_kb);
+    _exit(0);
+}
+
+static void child_encaps(int wfd){
     uint8_t pk[CRYPTO_PUBLICKEYBYTES];
     uint8_t sk[CRYPTO_SECRETKEYBYTES];
     uint8_t ct[CRYPTO_CIPHERTEXTBYTES];
-    uint8_t ss1[CRYPTO_BYTES];
-    uint8_t ss2[CRYPTO_BYTES];
+    uint8_t ss[CRYPTO_BYTES];
 
-    unsigned long long total_cycles_kp = 0, total_cycles_enc = 0, total_cycles_dec = 0;
-    double total_time_kp = 0.0, total_time_enc = 0.0, total_time_dec = 0.0;
-
-    // Memory stats (averages + peaks)
-    double sum_heap_kp = 0.0, sum_heap_enc = 0.0, sum_heap_dec = 0.0;
-    double sum_stack_kp = 0.0, sum_stack_enc = 0.0, sum_stack_dec = 0.0;
-    long peak_heap_kb = 0, peak_stack_kb = 0;
-
-    // Warm-up
-    for (int i = 0; i < 5; i++) {
-        crypto_kem_keypair(pk, sk);
-        crypto_kem_enc(ct, ss1, pk);
-        crypto_kem_dec(ss2, ct, sk);
-    }
-
-    for (int i = 0; i < ITERATIONS; i++) {
-        // === Keypair ===
-        int fd = -1;
-        if (perf_ok) {
-            fd = perf_event_open(&pe, 0, 0, -1, 0);
-            if (fd == -1) perf_ok = 0;
-        }
-
-        struct timespec start, end;
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
-
-        crypto_kem_keypair(pk, sk);
-
-        if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_DISABLE, 0); }
-        clock_gettime(CLOCK_MONOTONIC, &end);
-
-        unsigned long long cycles = 0ULL;
-        if (perf_ok) {
-            if (read(fd, &cycles, sizeof(cycles)) != (ssize_t)sizeof(cycles)) cycles = 0ULL;
-            close(fd);
-        }
-
-        total_cycles_kp += cycles;
-        total_time_kp += time_diff_ns(start, end) / 1e6;
-
-        long heap_kb = current_heap_kb();
-        long stack_kb = current_stack_kb();
-        if (heap_kb > 0) { sum_heap_kp += heap_kb; if (heap_kb > peak_heap_kb) peak_heap_kb = heap_kb; }
-        if (stack_kb > 0) { sum_stack_kp += stack_kb; if (stack_kb > peak_stack_kb) peak_stack_kb = stack_kb; }
-
-        // === Encapsulation ===
-        fd = -1;
-        if (perf_ok) {
-            fd = perf_event_open(&pe, 0, 0, -1, 0);
-            if (fd == -1) perf_ok = 0;
-        }
-
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
-
-        crypto_kem_enc(ct, ss1, pk);
-
-        if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_DISABLE, 0); }
-        clock_gettime(CLOCK_MONOTONIC, &end);
-
-        cycles = 0ULL;
-        if (perf_ok) {
-            if (read(fd, &cycles, sizeof(cycles)) != (ssize_t)sizeof(cycles)) cycles = 0ULL;
-            close(fd);
-        }
-
-        total_cycles_enc += cycles;
-        total_time_enc += time_diff_ns(start, end) / 1e6;
-
-        heap_kb = current_heap_kb();
-        stack_kb = current_stack_kb();
-        if (heap_kb > 0) { sum_heap_enc += heap_kb; if (heap_kb > peak_heap_kb) peak_heap_kb = heap_kb; }
-        if (stack_kb > 0) { sum_stack_enc += stack_kb; if (stack_kb > peak_stack_kb) peak_stack_kb = stack_kb; }
-
-        // === Decapsulation ===
-        fd = -1;
-        if (perf_ok) {
-            fd = perf_event_open(&pe, 0, 0, -1, 0);
-            if (fd == -1) perf_ok = 0;
-        }
-
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
-
-        crypto_kem_dec(ss2, ct, sk);
-
-        if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_DISABLE, 0); }
-        clock_gettime(CLOCK_MONOTONIC, &end);
-
-        cycles = 0ULL;
-        if (perf_ok) {
-            if (read(fd, &cycles, sizeof(cycles)) != (ssize_t)sizeof(cycles)) cycles = 0ULL;
-            close(fd);
-        }
-
-        total_cycles_dec += cycles;
-        total_time_dec += time_diff_ns(start, end) / 1e6;
-
-        heap_kb = current_heap_kb();
-        stack_kb = current_stack_kb();
-        if (heap_kb > 0) { sum_heap_dec += heap_kb; if (heap_kb > peak_heap_kb) peak_heap_kb = heap_kb; }
-        if (stack_kb > 0) { sum_stack_dec += stack_kb; if (stack_kb > peak_stack_kb) peak_stack_kb = stack_kb; }
-    }
-
-    // Averages
-    double avg_heap_kp  = sum_heap_kp  / ITERATIONS;
-    double avg_heap_enc = sum_heap_enc / ITERATIONS;
-    double avg_heap_dec = sum_heap_dec / ITERATIONS;
-
-    double avg_stack_kp  = sum_stack_kp  / ITERATIONS;
-    double avg_stack_enc = sum_stack_enc / ITERATIONS;
-    double avg_stack_dec = sum_stack_dec / ITERATIONS;
-
-    printf("\n=== CRYSTALS-Kyber Benchmark (%d iterations) ===\n", ITERATIONS);
-
-    printf("\n[Keypair]");
-    printf("\n  Avg Time:    %.3f ms", total_time_kp / ITERATIONS);
-    if (total_cycles_kp) printf("\n  Avg Cycles:  %llu", (unsigned long long)(total_cycles_kp / ITERATIONS)); else printf("\n  Avg Cycles:  N/A");
-    printf("\n  Avg HEAP:    %.2f KB", avg_heap_kp);
-    printf("\n  Avg STACK:   %.2f KB", avg_stack_kp);
-
-    printf("\n\n[Encapsulation]");
-    printf("\n  Avg Time:    %.3f ms", total_time_enc / ITERATIONS);
-    if (total_cycles_enc) printf("\n  Avg Cycles:  %llu", (unsigned long long)(total_cycles_enc / ITERATIONS)); else printf("\n  Avg Cycles:  N/A");
-    printf("\n  Avg HEAP:    %.2f KB", avg_heap_enc);
-    printf("\n  Avg STACK:   %.2f KB", avg_stack_enc);
-
-    printf("\n\n[Decapsulation]");
-    printf("\n  Avg Time:    %.3f ms", total_time_dec / ITERATIONS);
-    if (total_cycles_dec) printf("\n  Avg Cycles:  %llu", (unsigned long long)(total_cycles_dec / ITERATIONS)); else printf("\n  Avg Cycles:  N/A");
-    printf("\n  Avg HEAP:    %.2f KB", avg_heap_dec);
-    printf("\n  Avg STACK:   %.2f KB", avg_stack_dec);
-
-    printf("\n\n[Peaks Observed During Run]");
-    printf("\n  Peak HEAP:   %ld KB", peak_heap_kb);
-    printf("\n  Peak STACK:  %ld KB", peak_stack_kb);
-
-    // Sanity: shared secret match
-    uint8_t ct2[CRYPTO_CIPHERTEXTBYTES];
-    uint8_t ssA[CRYPTO_BYTES], ssB[CRYPTO_BYTES];
+    // warm-up
     crypto_kem_keypair(pk, sk);
-    crypto_kem_enc(ct2, ssA, pk);
-    crypto_kem_dec(ssB, ct2, sk);
-    printf("\n\nShared Secret Match: %s\n",
-           (memcmp(ssA, ssB, CRYPTO_BYTES) == 0) ? "YES" : "NO");
+    crypto_kem_enc(ct, ss, pk);
+
+    struct perf_event_attr pe;
+    int perf_ok = 1;
+    int fd = perf_open_cycles_scaled(&pe);
+    if (fd == -1) { perror("perf_event_open encaps"); perf_ok = 0; }
+
+    struct timespec s,e;
+    clock_gettime(CLOCK_MONOTONIC, &s);
+    if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
+
+    for (int i=0; i<NUM_ITERATIONS; ++i) crypto_kem_enc(ct, ss, pk);
+
+    if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_DISABLE, 0); }
+    clock_gettime(CLOCK_MONOTONIC, &e);
+
+    double avg_ms = (tdiff_ns(s,e)/1e6)/NUM_ITERATIONS;
+    double avg_cycles = perf_ok ? perf_read_avg_cycles(fd) : 0.0;
+    if (perf_ok) close(fd);
+
+    long peak_kb = read_status_kb("VmHWM:");
+    dprintf(wfd, "ENC %.6f %.0f %ld\n", avg_ms, avg_cycles, peak_kb);
+    _exit(0);
+}
+
+static void child_decaps(int wfd){
+    uint8_t pk[CRYPTO_PUBLICKEYBYTES];
+    uint8_t sk[CRYPTO_SECRETKEYBYTES];
+    uint8_t ct[CRYPTO_CIPHERTEXTBYTES];
+    uint8_t ss1[CRYPTO_BYTES], ss2[CRYPTO_BYTES];
+
+    // warm-up
+    crypto_kem_keypair(pk, sk);
+    crypto_kem_enc(ct, ss1, pk);
+    crypto_kem_dec(ss2, ct, sk);
+
+    struct perf_event_attr pe;
+    int perf_ok = 1;
+    int fd = perf_open_cycles_scaled(&pe);
+    if (fd == -1) { perror("perf_event_open decaps"); perf_ok = 0; }
+
+    struct timespec s,e;
+    clock_gettime(CLOCK_MONOTONIC, &s);
+    if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
+
+    for (int i=0; i<NUM_ITERATIONS; ++i) crypto_kem_dec(ss2, ct, sk);
+
+    if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_DISABLE, 0); }
+    clock_gettime(CLOCK_MONOTONIC, &e);
+
+    double avg_ms = (tdiff_ns(s,e)/1e6)/NUM_ITERATIONS;
+    double avg_cycles = perf_ok ? perf_read_avg_cycles(fd) : 0.0;
+    if (perf_ok) close(fd);
+
+    long peak_kb = read_status_kb("VmHWM:");
+    dprintf(wfd, "DEC %.6f %.0f %ld\n", avg_ms, avg_cycles, peak_kb);
+    _exit(0);
+}
+
+/* ===================== parent ===================== */
+
+static int fork_and_capture(void (*child_fn)(int), char *outbuf, size_t outlen){
+    int p[2]; if (pipe(p)!=0) { perror("pipe"); return -1; }
+    pid_t c = fork();
+    if (c==0) { close(p[0]); child_fn(p[1]); }
+    close(p[1]);
+    ssize_t n = read(p[0], outbuf, outlen-1);
+    if (n>0) outbuf[n]=0;
+    close(p[0]);
+    int st; waitpid(c, &st, 0);
+    return 0;
+}
+
+int main(void){
+    char kbuf[128]={0}, ebuf[128]={0}, dbuf[128]={0};
+
+    fork_and_capture(child_keypair, kbuf, sizeof kbuf);
+    fork_and_capture(child_encaps, ebuf, sizeof ebuf);
+    fork_and_capture(child_decaps, dbuf, sizeof dbuf);
+
+    char t1[4]={0}, t2[4]={0}, t3[4]={0};
+    double kp_ms=0, en_ms=0, de_ms=0, kp_cyc=0, en_cyc=0, de_cyc=0;
+    long kp_peak=0, en_peak=0, de_peak=0;
+
+    sscanf(kbuf, "%3s %lf %lf %ld", t1, &kp_ms, &kp_cyc, &kp_peak);
+    sscanf(ebuf, "%3s %lf %lf %ld", t2, &en_ms, &en_cyc, &en_peak);
+    sscanf(dbuf, "%3s %lf %lf %ld", t3, &de_ms, &de_cyc, &de_peak);
+
+    printf("\n| Operation     | Avg Time (ms) |   Avg Cycles | Peak Memory (KB) |\n");
+    printf("|---------------|--------------:|-------------:|------------------:|\n");
+
+    if (kp_cyc>0) printf("| Keypair       | %13.3f | %13.0f | %16ld |\n", kp_ms, kp_cyc, kp_peak);
+    else          printf("| Keypair       | %13.3f | %13s | %16ld |\n", kp_ms, "N/A", kp_peak);
+
+    if (en_cyc>0) printf("| Encapsulation | %13.3f | %13.0f | %16ld |\n", en_ms, en_cyc, en_peak);
+    else          printf("| Encapsulation | %13.3f | %13s | %16ld |\n", en_ms, "N/A", en_peak);
+
+    if (de_cyc>0) printf("| Decapsulation | %13.3f | %13.0f | %16ld |\n\n", de_ms, de_cyc, de_peak);
+    else          printf("| Decapsulation | %13.3f | %13s | %16ld |\n\n", de_ms, "N/A", de_peak);
+
     return 0;
 }
