@@ -1,3 +1,4 @@
+// main.c — Kyber benchmark with memory *consumption* (RSS) + peak (VmHWM)
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>
@@ -18,47 +19,50 @@
 #define ITERATIONS 1000
 #endif
 
-// --- timing helpers ---
+// ---------- timing ----------
 static inline double time_diff_ns(struct timespec s, struct timespec e) {
     return (e.tv_sec - s.tv_sec) * 1e9 + (e.tv_nsec - s.tv_nsec);
 }
 
-// --- perf_event_open wrapper ---
+// ---------- perf_event_open wrapper ----------
 static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
                             int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
-// --- pin to CPU 0 (optional) ---
-static int pin_to_cpu0(void) {
+// ---------- optional: pin to CPU 0 ----------
+static void pin_to_cpu0(void) {
     cpu_set_t mask;
     CPU_ZERO(&mask);
     CPU_SET(0, &mask);
-    if (sched_setaffinity(0, sizeof(mask), &mask) != 0) {
-        perror("sched_setaffinity");
-        return -1;
-    }
-    return 0;
+    (void)sched_setaffinity(0, sizeof(mask), &mask);
 }
 
-// --- current RSS in KB via /proc/self/statm ---
-static long current_rss_kb(void) {
-    static long page_kb = 0;
-    if (page_kb == 0) {
-        long ps = sysconf(_SC_PAGESIZE);
-        if (ps <= 0) return -1;
-        page_kb = ps / 1024;
-        if (page_kb == 0) page_kb = 1; // avoid div-by-zero
-    }
-    FILE *f = fopen("/proc/self/statm", "r");
+// ---------- /proc/self/status helpers ----------
+static long read_status_kb(const char *key) {
+    FILE *f = fopen("/proc/self/status", "r");
     if (!f) return -1;
-    unsigned long size_pages = 0, resident_pages = 0;
-    int n = fscanf(f, "%lu %lu", &size_pages, &resident_pages);
+    char line[256];
+    long val = -1;
+    size_t keylen = strlen(key);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, keylen) == 0) {
+            // expected format: "Key:   <num> kB"
+            long tmp = -1;
+            if (sscanf(line + keylen, " %ld", &tmp) == 1) {
+                val = tmp; // already in KB
+            }
+            break;
+        }
+    }
     fclose(f);
-    if (n != 2) return -1;
-    return (long)(resident_pages * page_kb);
+    return val;
 }
 
+static long current_rss_kb(void) { return read_status_kb("VmRSS:"); }  // total RAM in use now
+static long peak_hwm_kb(void)     { return read_status_kb("VmHWM:"); }  // peak RAM (high-water)
+
+// ---------- main ----------
 int main(void) {
     pin_to_cpu0();
 
@@ -92,7 +96,10 @@ int main(void) {
 
     unsigned long long total_cycles_kp = 0, total_cycles_enc = 0, total_cycles_dec = 0;
     double total_time_kp = 0.0, total_time_enc = 0.0, total_time_dec = 0.0;
-    long mem_kp = 0, mem_enc = 0, mem_dec = 0;
+
+    // Memory *consumption* (KB) sampled *after* each op
+    double sum_rss_after_kp = 0.0, sum_rss_after_enc = 0.0, sum_rss_after_dec = 0.0;
+    long observed_peak_kb = peak_hwm_kb(); // baseline peak at start
 
     // Warm-up
     for (int i = 0; i < 5; i++) {
@@ -109,8 +116,6 @@ int main(void) {
             if (fd == -1) perf_ok = 0;
         }
 
-        long rss_before = current_rss_kb();
-
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
         if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
@@ -120,17 +125,18 @@ int main(void) {
         if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_DISABLE, 0); }
         clock_gettime(CLOCK_MONOTONIC, &end);
 
-        long rss_after = current_rss_kb();
-        long delta_kb = (rss_after >= 0 && rss_before >= 0) ? (rss_after - rss_before) : 0;
-
         unsigned long long cycles = 0ULL;
         if (perf_ok) {
             if (read(fd, &cycles, sizeof(cycles)) != (ssize_t)sizeof(cycles)) cycles = 0ULL;
             close(fd);
         }
+
         total_cycles_kp += cycles;
         total_time_kp += time_diff_ns(start, end) / 1e6;
-        mem_kp += delta_kb;
+        long rss_now = current_rss_kb();
+        if (rss_now > 0) sum_rss_after_kp += (double)rss_now;
+        long hwm_now = peak_hwm_kb();
+        if (hwm_now > observed_peak_kb) observed_peak_kb = hwm_now;
 
         // === Encapsulation ===
         fd = -1;
@@ -138,8 +144,6 @@ int main(void) {
             fd = perf_event_open(&pe, 0, 0, -1, 0);
             if (fd == -1) perf_ok = 0;
         }
-
-        rss_before = current_rss_kb();
 
         clock_gettime(CLOCK_MONOTONIC, &start);
         if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
@@ -149,17 +153,18 @@ int main(void) {
         if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_DISABLE, 0); }
         clock_gettime(CLOCK_MONOTONIC, &end);
 
-        rss_after = current_rss_kb();
-        delta_kb = (rss_after >= 0 && rss_before >= 0) ? (rss_after - rss_before) : 0;
-
         cycles = 0ULL;
         if (perf_ok) {
             if (read(fd, &cycles, sizeof(cycles)) != (ssize_t)sizeof(cycles)) cycles = 0ULL;
             close(fd);
         }
+
         total_cycles_enc += cycles;
         total_time_enc += time_diff_ns(start, end) / 1e6;
-        mem_enc += delta_kb;
+        rss_now = current_rss_kb();
+        if (rss_now > 0) sum_rss_after_enc += (double)rss_now;
+        hwm_now = peak_hwm_kb();
+        if (hwm_now > observed_peak_kb) observed_peak_kb = hwm_now;
 
         // === Decapsulation ===
         fd = -1;
@@ -167,8 +172,6 @@ int main(void) {
             fd = perf_event_open(&pe, 0, 0, -1, 0);
             if (fd == -1) perf_ok = 0;
         }
-
-        rss_before = current_rss_kb();
 
         clock_gettime(CLOCK_MONOTONIC, &start);
         if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
@@ -178,42 +181,55 @@ int main(void) {
         if (perf_ok) { ioctl(fd, PERF_EVENT_IOC_DISABLE, 0); }
         clock_gettime(CLOCK_MONOTONIC, &end);
 
-        rss_after = current_rss_kb();
-        delta_kb = (rss_after >= 0 && rss_before >= 0) ? (rss_after - rss_before) : 0;
-
         cycles = 0ULL;
         if (perf_ok) {
             if (read(fd, &cycles, sizeof(cycles)) != (ssize_t)sizeof(cycles)) cycles = 0ULL;
             close(fd);
         }
+
         total_cycles_dec += cycles;
         total_time_dec += time_diff_ns(start, end) / 1e6;
-        mem_dec += delta_kb;
+        rss_now = current_rss_kb();
+        if (rss_now > 0) sum_rss_after_dec += (double)rss_now;
+        hwm_now = peak_hwm_kb();
+        if (hwm_now > observed_peak_kb) observed_peak_kb = hwm_now;
     }
 
-    // Print averages
+    // Averages
+    double avg_rss_kp  = sum_rss_after_kp  / ITERATIONS;
+    double avg_rss_enc = sum_rss_after_enc / ITERATIONS;
+    double avg_rss_dec = sum_rss_after_dec / ITERATIONS;
+
     printf("\n=== CRYSTALS-Kyber Benchmark (%d iterations) ===\n", ITERATIONS);
 
     printf("\n[Keypair]");
     printf("\n  Avg Time:   %.3f ms", total_time_kp / ITERATIONS);
     if (total_cycles_kp) printf("\n  Avg Cycles: %llu", (unsigned long long)(total_cycles_kp / ITERATIONS)); else printf("\n  Avg Cycles: N/A");
-    printf("\n  Avg Mem Δ:  %.2f KB", (double)mem_kp / ITERATIONS);
+    printf("\n  Avg RSS:    %.2f KB", avg_rss_kp);
 
     printf("\n\n[Encapsulation]");
     printf("\n  Avg Time:   %.3f ms", total_time_enc / ITERATIONS);
     if (total_cycles_enc) printf("\n  Avg Cycles: %llu", (unsigned long long)(total_cycles_enc / ITERATIONS)); else printf("\n  Avg Cycles: N/A");
-    printf("\n  Avg Mem Δ:  %.2f KB", (double)mem_enc / ITERATIONS);
+    printf("\n  Avg RSS:    %.2f KB", avg_rss_enc);
 
     printf("\n\n[Decapsulation]");
     printf("\n  Avg Time:   %.3f ms", total_time_dec / ITERATIONS);
     if (total_cycles_dec) printf("\n  Avg Cycles: %llu", (unsigned long long)(total_cycles_dec / ITERATIONS)); else printf("\n  Avg Cycles: N/A");
-    printf("\n  Avg Mem Δ:  %.2f KB", (double)mem_dec / ITERATIONS);
+    printf("\n  Avg RSS:    %.2f KB", avg_rss_dec);
+
+    // Peak memory across the whole run
+    long final_peak = peak_hwm_kb();
+    if (final_peak < observed_peak_kb) final_peak = observed_peak_kb;
+    printf("\n\n[Process Memory]");
+    printf("\n  Peak VmHWM:  %ld KB", final_peak);
 
     // Sanity: shared secret match
+    uint8_t ct2[CRYPTO_CIPHERTEXTBYTES];
+    uint8_t ssA[CRYPTO_BYTES], ssB[CRYPTO_BYTES];
     crypto_kem_keypair(pk, sk);
-    crypto_kem_enc(ct, ss1, pk);
-    crypto_kem_dec(ss2, ct, sk);
+    crypto_kem_enc(ct2, ssA, pk);
+    crypto_kem_dec(ssB, ct2, sk);
     printf("\n\nShared Secret Match: %s\n",
-           (memcmp(ss1, ss2, CRYPTO_BYTES) == 0) ? "YES" : "NO");
+           (memcmp(ssA, ssB, CRYPTO_BYTES) == 0) ? "YES" : "NO");
     return 0;
 }
